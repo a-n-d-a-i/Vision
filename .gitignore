@@ -3,3 +3,4 @@ dist/
 history.jsonl
 *.log
 .env
+pnpm-lock.yaml
