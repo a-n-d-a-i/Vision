@@ -11,7 +11,7 @@
  */
 
 import { Bot, Context } from 'grammy';
-import { Anthropic } from '@anthropic-ai/sdk';
+import { query } from '@anthropic-ai/claude-agent-sdk';
 import fs from 'fs';
 import path from 'path';
 
@@ -20,11 +20,14 @@ import path from 'path';
 const ASSISTANT_NAME = 'JARVIS';
 const HISTORY_FILE = path.join(process.cwd(), 'history.jsonl');
 const MAX_HISTORY = 100;
+const ALLOWED_CHAT_IDS = [ Number(process.env.MY_TG_CHAT_ID) ]
+console.log('Allowed Chat IDs');
+console.log(ALLOWED_CHAT_IDS)
 
 // ========== STATE ==========
 
 let bot: Bot;
-const anthropic = new Anthropic();
+const sessionStore: Map<number, string> = new Map(); // chatId -> sessionId
 
 // ========== HISTORY ==========
 
@@ -32,6 +35,8 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   timestamp: string;
+  chatId?: number;
+  sessionId?: string;
 }
 
 function loadHistory(): Message[] {
@@ -45,14 +50,29 @@ function saveHistory(history: Message[]): void {
   fs.writeFileSync(HISTORY_FILE, lines);
 }
 
-function addToHistory(role: 'user' | 'assistant', content: string): void {
+function addToHistory(role: 'user' | 'assistant', content: string, chatId?: number, sessionId?: string): void {
   const history = loadHistory();
-  history.push({ role, content, timestamp: new Date().toISOString() });
+  history.push({ role, content, timestamp: new Date().toISOString(), chatId, sessionId });
   // Keep only recent messages
   if (history.length > MAX_HISTORY) {
     history.splice(0, history.length - MAX_HISTORY);
   }
   saveHistory(history);
+}
+
+function getSessionId(chatId: number): string | undefined {
+  const history = loadHistory();
+  // Find most recent session for this chat
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].chatId === chatId && history[i].sessionId) {
+      return history[i].sessionId;
+    }
+  }
+  return sessionStore.get(chatId);
+}
+
+function clearSession(chatId: number): void {
+  sessionStore.delete(chatId);
 }
 
 // ========== TELEGRAM ==========
@@ -73,6 +93,34 @@ async function connectTelegram(): Promise<void> {
   console.log(`✓ Assistant: ${ASSISTANT_NAME}`);
   console.log(`✓ Send /start or any message to chat\n`);
 
+  // Handle /reset command
+  bot.command('reset', async (ctx: Context) => {
+    const chatId = ctx.chat?.id;
+    if (!chatId) return;
+
+    if (!ALLOWED_CHAT_IDS.includes(chatId)) {
+      await ctx.reply('Unauthorized.');
+      return;
+    }
+
+    clearSession(chatId);
+    await ctx.reply('Session cleared.');
+  });
+
+  // Handle /status command
+  bot.command('status', async (ctx: Context) => {
+    const chatId = ctx.chat?.id;
+    if (!chatId) return;
+
+    if (!ALLOWED_CHAT_IDS.includes(chatId)) {
+      await ctx.reply('Unauthorized.');
+      return;
+    }
+
+    const sessionId = getSessionId(chatId);
+    await ctx.reply(`Session: ${sessionId ? sessionId.slice(0, 8) + '...' : 'none'}`);
+  });
+
   // Handle all text messages
   bot.on('message:text', async (ctx: Context) => {
     const msg = ctx.message;
@@ -84,28 +132,33 @@ async function connectTelegram(): Promise<void> {
     const chatId = ctx.chat?.id;
     if (!chatId) return;
 
-    // Skip commands other than /start
-    if (text.startsWith('/') && text !== '/start') {
+    // Auth check
+    if (!ALLOWED_CHAT_IDS.includes(chatId)) {
+      console.log('Unauthorized ID: ' + chatId)
+      await ctx.reply('Unauthorized.');
+      return;
+    }
+
+    // Skip commands handled elsewhere
+    if (text.startsWith('/')) {
+      if (text === '/start') {
+        await ctx.reply(`${ASSISTANT_NAME} ready. Full agent capabilities enabled.`);
+      }
       return;
     }
 
     console.log(`\n[${new Date().toLocaleTimeString()}] Received: ${text.slice(0, 100)}${text.length > 100 ? '...' : ''}`);
 
-    // Show typing indicator
-    await ctx.api.sendChatAction(chatId, 'typing');
-
-    // Get Claude response
+    // Get agent response
     try {
-      const response = await getResponse(text);
+      const response = await getAgentResponse(text, chatId, ctx);
       console.log(`[${new Date().toLocaleTimeString()}] Sent: ${response.slice(0, 100)}${response.length > 100 ? '...' : ''}`);
 
-      await ctx.reply(`${ASSISTANT_NAME}: ${response}`);
-
-      addToHistory('user', text);
-      addToHistory('assistant', response);
+      addToHistory('user', text, chatId);
+      addToHistory('assistant', response, chatId);
     } catch (err) {
       console.error('Error:', err);
-      await ctx.reply(`${ASSISTANT_NAME}: Sorry, something went wrong.`);
+      await ctx.reply(`${ASSISTANT_NAME}: Error occurred.`);
     }
   });
 
@@ -113,28 +166,88 @@ async function connectTelegram(): Promise<void> {
   await bot.start();
 }
 
-// ========== CLAUDE ==========
+// ========== AGENT ==========
 
-async function getResponse(userMessage: string): Promise<string> {
-  const history = loadHistory();
+async function getAgentResponse(userMessage: string, chatId: number, ctx: Context): Promise<string> {
+  const sessionId = getSessionId(chatId);
 
-  // Convert to Anthropic format (last 20 messages for context)
-  const messages = history
-    .slice(-20)
-    .map(m => ({ role: m.role, content: m.content }));
+  let lastUpdate = Date.now();
+  let statusMessage: any = null;
+  let finalResponse = '';
+  let currentSessionId = '';
 
-  // Add current message
-  messages.push({ role: 'user', content: userMessage });
+  try {
+    const q = query({
+      prompt: userMessage,
+      options: {
+        resume: sessionId,
+        cwd: '/agent',
+        allowedTools: ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'Task', 'WebFetch', 'WebSearch', 'AskUserQuestion', 'Skill', 'NotebookEdit'],
+        canUseTool: async () => ({ behavior: 'allow' })
+      }
+    });
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-5',
-    max_tokens: 4096,
-    messages,
-    system: `You are ${ASSISTANT_NAME}, a helpful AI assistant. Respond concisely and conversationally. Personality: 50% Alfred from Batman, 50% JARVIS from Iron Man.`
-  });
+    // Iterate through messages
+    for await (const msg of q) {
+      // Update typing every 5s
+      const now = Date.now();
+      if (now - lastUpdate > 5000) {
+        lastUpdate = now;
+        try {
+          await ctx.api.sendChatAction(chatId, 'typing');
+        } catch {}
+      }
 
-  const block = response.content.find(b => b.type === 'text');
-  return block && 'text' in block ? block.text : 'Sorry, I could not generate a response.';
+      // Track session ID
+      if ('session_id' in msg) {
+        currentSessionId = msg.session_id;
+      }
+
+      // Show tool usage
+      if (msg.type === 'assistant') {
+        for (const block of msg.message.content) {
+          if (block.type === 'tool_use') {
+            const status = `${ASSISTANT_NAME}: ${block.name}...`;
+
+            if (!statusMessage) {
+              statusMessage = await ctx.reply(status);
+            } else {
+              try {
+                await ctx.api.editMessageText(chatId, statusMessage.message_id, status);
+              } catch {}
+            }
+          }
+
+          if (block.type === 'text') {
+            finalResponse += block.text;
+          }
+        }
+      }
+    }
+
+    // Store session
+    if (currentSessionId) {
+      sessionStore.set(chatId, currentSessionId);
+      addToHistory('assistant', '', chatId, currentSessionId);
+    }
+
+    // Send final response
+    const output = finalResponse || 'Done.';
+
+    if (statusMessage) {
+      try {
+        await ctx.api.editMessageText(chatId, statusMessage.message_id, `${ASSISTANT_NAME}: ${output}`);
+      } catch {
+        await ctx.reply(`${ASSISTANT_NAME}: ${output}`);
+      }
+    } else {
+      await ctx.reply(`${ASSISTANT_NAME}: ${output}`);
+    }
+
+    return output;
+  } catch (err) {
+    throw err;
+  }
 }
 
 // ========== MAIN ==========
@@ -143,9 +256,12 @@ async function main(): Promise<void> {
   console.log('NanoClaw - Single File Version\n');
 
   if (!process.env.ANTHROPIC_API_KEY) {
-    console.error('Error: ANTHROPIC_API_KEY environment variable not set');
+    console.error('Error: ANTHROPIC_API_KEY not set');
     process.exit(1);
   }
+
+  console.log(`✓ Allowed chats: ${ALLOWED_CHAT_IDS.join(', ')}`);
+  console.log(`✓ Working directory: /agent`);
 
   await connectTelegram();
 }

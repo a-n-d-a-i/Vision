@@ -24,6 +24,7 @@
   },
   "homepage": "https://github.com/a-n-d-a-i/Vision#readme",
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.31",
     "@anthropic-ai/sdk": "^0.72.1",
     "grammy": "^1.39.3"
   },
