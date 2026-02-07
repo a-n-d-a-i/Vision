@@ -16,6 +16,7 @@ function shellQuote(value: string): string {
 }
 
 const AGENT_BIN = USE_CLAUDE ? shellQuote(CLAUDE_BIN) : shellQuote(CODEX_BIN);
+const RESTART_CMD: string = 'systemctl --user restart ultron';
 const RESET_CMD: string = USE_CLAUDE
   ? `${AGENT_BIN} -p '(NOTE: Resetting session. Say "Session reset." and exit.)'`
   : `${AGENT_BIN} exec '(NOTE: Resetting session. Say "Session reset." and exit.)'`;
@@ -46,17 +47,17 @@ function executeCommand(cmd: string, callback: (output: string) => void): void {
   });
 }
 
-function runAgent(prompt: string, callback: (output: string) => void): void {
-  let cmd = USE_CLAUDE
-    ? `${AGENT_BIN} -p ${JSON.stringify(prompt)}`
-    : `${AGENT_BIN} exec ${JSON.stringify(prompt)}`;
+// function runAgent(prompt: string, callback: (output: string) => void): void {
+//   let cmd = USE_CLAUDE
+//     ? `${AGENT_BIN} -p ${JSON.stringify(prompt)}`
+//     : `${AGENT_BIN} exec ${JSON.stringify(prompt)}`;
   
-  if (USE_CLAUDE) {
-    cmd = `script -q -c ${JSON.stringify(cmd)} /dev/null`;
-  }
+//   if (USE_CLAUDE) {
+//     cmd = `script -q -c ${JSON.stringify(cmd)} /dev/null`;
+//   }
   
-  executeCommand(cmd, callback);
-}
+//   executeCommand(cmd, callback);
+// }
 
 async function main(): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -88,9 +89,14 @@ async function main(): Promise<void> {
       return;
     }
 
+    // Show typing indicator
+    await ctx.api.sendChatAction(chatId, 'typing');
+
     let cmd: string;
     if (text == 'reset' || text == 'Reset' || text == 'reset.' || text == 'Reset.') {
       cmd = RESET_CMD;
+    } else if (text == 'restart' || text == 'Restart' || text == 'restart.' || text == 'Restart.') {
+      cmd = RESTART_CMD;
     } else {
       cmd = EXEC_CMD + ' ' + JSON.stringify(text);
     }

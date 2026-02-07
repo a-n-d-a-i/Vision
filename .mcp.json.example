@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "x-search": {
+      "command": "node",
+      "args": ["/agent/ULTRON/mcp/x_search/dist/index.js"],
+      "env": {
+        "XAI_API_KEY": "${XAI_API_KEY}"
+      }
+    }
+  }
+}

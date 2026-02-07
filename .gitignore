@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+.mcp.json
 
 # etc
 node_modules/
